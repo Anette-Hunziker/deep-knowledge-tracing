@@ -12,7 +12,6 @@ import numpy as np
 import tensorflow as tf
 import time
 import csv
-from random import shuffle
 import random
 from sklearn.metrics import mean_squared_error
 from sklearn.metrics import r2_score
@@ -32,6 +31,7 @@ tf.flags.DEFINE_integer("batch_size", 32, "Batch size for training.")
 tf.flags.DEFINE_integer("epochs", 150, "Number of epochs to train for.")
 tf.flags.DEFINE_boolean("allow_soft_placement", True, "Allow device soft device placement")
 tf.flags.DEFINE_boolean("log_device_placement", False, "Log placement of ops on devices")
+tf.flags.DEFINE_boolean("save_test_logits", False, "Save test data logits on disk")
 tf.flags.DEFINE_string("train_data_path", 'data/0910_b_train.csv', "Path to the training dataset")
 tf.flags.DEFINE_string("test_data_path", 'data/0910_b_test.csv', "Path to the testing dataset")
 
@@ -110,9 +110,10 @@ class StudentModel(object):
         # from output nodes to pick up the right one we want
         logits = tf.reshape(logits, [-1])
         selected_logits = tf.gather(logits, self.target_id)
+        self._all_logits = logits
 
         #make prediction
-        self._pred = self._pred_values = pred_values = tf.sigmoid(selected_logits)
+        self._pred = tf.sigmoid(selected_logits)
 
         # loss function
         loss = tf.reduce_sum(tf.nn.sigmoid_cross_entropy_with_logits(selected_logits, target_correctness))
@@ -149,8 +150,8 @@ class StudentModel(object):
         return self._initial_state
 
     @property
-    def pred_values(self):
-        return self._pred_values
+    def all_logits(self):
+        return self._all_logits
 
     @property
     def cost(self):
@@ -176,6 +177,7 @@ def run_epoch(session, m, students, eval_op, verbose=False):
     index = 0
     pred_labels = []
     actual_labels = []
+    all_all_logits = []
     while(index+m.batch_size < len(students)):
         x = np.zeros((m.batch_size, m.num_steps))
         target_id = []
@@ -199,23 +201,25 @@ def run_epoch(session, m, students, eval_op, verbose=False):
 
         index += m.batch_size
 
-        pred, _ = session.run([m.pred, eval_op], feed_dict={
+        pred, _, all_logits = session.run([m.pred, eval_op, m.all_logits], feed_dict={
             m.input_data: x, m.target_id: target_id,
             m.target_correctness: target_correctness})
 
         for p in pred:
             pred_labels.append(p)
-    #print pred_labels
+
+        all_all_logits.append(all_logits)
+
     rmse = sqrt(mean_squared_error(actual_labels, pred_labels))
     fpr, tpr, thresholds = metrics.roc_curve(actual_labels, pred_labels, pos_label=1)
     auc = metrics.auc(fpr, tpr)
 
     #calculate r^2
     r2 = r2_score(actual_labels, pred_labels)
-    return rmse, auc, r2
+    return rmse, auc, r2, np.concatenate(all_all_logits)
 
 
-def read_data_from_csv_file(fileName):
+def read_data_from_csv_file(fileName, shuffle=False):
     config = HyperParamsConfig()
     inputs = []
     targets = []
@@ -246,7 +250,8 @@ def read_data_from_csv_file(fileName):
             index += 3
     #shuffle the tuple
 
-    random.shuffle(tuple_rows)
+    if shuffle:
+        random.shuffle(tuple_rows)
     print "The number of students is ", len(tuple_rows)
     print "Finish reading data"
     return tuple_rows, max_num_problems, max_skill_num+1
@@ -263,13 +268,14 @@ def main(unused_args):
     #your model name
     model_name = "DKT"
 
-    train_students, train_max_num_problems, train_max_skill_num = read_data_from_csv_file(train_data_path)
+    train_students, train_max_num_problems, train_max_skill_num = read_data_from_csv_file(train_data_path, shuffle=True)
     config.num_steps = train_max_num_problems
-    
+
     config.num_skills = train_max_skill_num
-    test_students, test_max_num_problems, test_max_skill_num = read_data_from_csv_file(test_data_path)
+    test_students, test_max_num_problems, test_max_skill_num = read_data_from_csv_file(test_data_path, shuffle=False)
     eval_config.num_steps = test_max_num_problems
     eval_config.num_skills = test_max_skill_num
+    print 'test_max_num_problems=%d, test_max_skill_num=%d' % (test_max_num_problems, test_max_skill_num)
 
     with tf.Graph().as_default():
         session_conf = tf.ConfigProto(allow_soft_placement=FLAGS.allow_soft_placement,
@@ -309,7 +315,7 @@ def main(unused_args):
             saver = tf.train.Saver(tf.all_variables())
 
             for i in range(config.max_max_epoch):
-                rmse, auc, r2 = run_epoch(session, m, train_students, train_op, verbose=True)
+                rmse, auc, r2, _ = run_epoch(session, m, train_students, train_op, verbose=False)
                 print("Epoch: %d Train Metrics:\n rmse: %.3f \t auc: %.3f \t r2: %.3f \n" % (i + 1, rmse, auc, r2))
 
                 if((i+1) % FLAGS.evaluation_interval == 0):
@@ -317,13 +323,16 @@ def main(unused_args):
                     save_path = saver.save(session, model_name)
                     print("*"*10)
                     print("Start to test model....")
-                    rmse, auc, r2 = run_epoch(session, mtest, test_students, tf.no_op())
+                    rmse, auc, r2, all_logits = run_epoch(session, mtest, test_students, tf.no_op(), verbose=True)
                     print("Epoch: %d Test Metrics:\n rmse: %.3f \t auc: %.3f \t r2: %.3f" % (i+1, rmse, auc, r2))
                     with open(result_file_path, "a+") as f:
                         f.write("Epoch: %d Test Metrics:\n rmse: %.3f \t auc: %.3f \t r2: %.3f" % ((i+1)/2, rmse, auc, r2))
                         f.write("\n")
 
                         print("*"*10)
+                    # save the logits
+                    if FLAGS.save_test_logits:
+                        np.savetxt(result_file_path + ('.e%02d.logits' % (i+1)), all_logits)
 
 if __name__ == "__main__":
     tf.app.run()
